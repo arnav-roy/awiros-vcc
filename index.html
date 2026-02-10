@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>VCC Pipeline Flowchart</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #08090c; color: #e8eaed; font-family: 'IBM Plex Sans', sans-serif; }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #2a2d35; border-radius: 3px; }
+  code { font-family: 'JetBrains Mono', monospace; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+
+<script type="text/babel">
+const { useState, useRef, useEffect } = React;
+
+const STAGES = [
+  {
+    id: "camera",
+    label: "Camera Input",
+    icon: "\u{1F4F7}",
+    phase: "ingestion",
+    desc: "Base camera module captures frames from RTSP/video streams. FPS module throttles to configured rate. Frames stored in awi::meta.streams[].aframe.",
+    inputs: ["RTSP stream", "Video file"],
+    outputs: ["Raw frames (cv::Mat)", "Stream metadata"],
+    config: ["Camera URI", "FPS limit"],
+    module: "base_camera_module + base_camera_fps_module",
+  },
+  {
+    id: "detection",
+    label: "Object Detection",
+    icon: "\u{1F50D}",
+    phase: "detection",
+    desc: "Primary object detection model (ONNX/TensorRT). Detects vehicles, plates, and tyres in a single pass. If axle_counting is enabled, a separate wheel-specific model is loaded instead.",
+    inputs: ["Raw frames"],
+    outputs: ["Bounding boxes", "Class labels", "Confidence scores"],
+    config: ["spec.json model path", "Confidence threshold", "Provider (GPU/CPU)"],
+    module: "ModelFactory \u2192 Object",
+    detail: "Classes: car, truck, bus, motorbike, 3wheeler, bicycle, mini-bus, mini-truck, tractor, tyre, one_row, two_row",
+  },
+  {
+    id: "obj_filter",
+    label: "Object Filter",
+    icon: "\u{1F3F7}\uFE0F",
+    phase: "detection",
+    desc: "Whitelist filter \u2014 keeps only detections matching allowed class labels. Label set varies based on enable_OCR and axle_counting flags.",
+    inputs: ["All detections"],
+    outputs: ["Filtered detections (vehicles + optional plates/tyres)"],
+    config: ["Label whitelist"],
+    module: "object_filtering_module",
+    detail: "Adds 'tyre' if axle_counting; adds 'one_row','two_row' if enable_OCR",
+  },
+  {
+    id: "conf_filter",
+    label: "Confidence Filter",
+    icon: "\u{1F4CA}",
+    phase: "detection",
+    desc: "Removes detections below the per-stream confidence threshold configured in detection_config.",
+    inputs: ["Filtered detections"],
+    outputs: ["High-confidence detections"],
+    config: ["Per-stream confidence threshold"],
+    module: "confidence_filter_module",
+  },
+  {
+    id: "region_filter",
+    label: "Region / Mask Filter",
+    icon: "\u{1F532}",
+    phase: "detection",
+    desc: "Filters blobs against user-defined polygonal ROIs (regions & masks). Uses configurable test point policy (bottom-center, corners, etc.). Associates each blob with its containing region label.",
+    inputs: ["High-confidence detections", "Region polygons"],
+    outputs: ["Region-associated blobs only"],
+    config: ["filter_policy", "Polygon vertices", "time_frequency \u2192 policy override"],
+    module: "object_filter_wrt_region_and_mask_module",
+    detail: "Policies: bottom_center_point, bottom_third_quarter_point, all_corner_points, top_left_point, etc. Uses cv::pointPolygonTest.",
+  },
+  {
+    id: "streamer",
+    label: "Live Stream",
+    icon: "\u{1F4FA}",
+    phase: "visualization",
+    desc: "Annotates current frame with bounding boxes and streams via configured output (RTSP/WebSocket). Runs before tracking so annotations show raw detections.",
+    inputs: ["Region-filtered blobs", "Current frame"],
+    outputs: ["Annotated stream output"],
+    config: ["show_livestream toggle"],
+    module: "live_annotation_module + base_camera_streamer_module",
+  },
+  {
+    id: "blob_assoc",
+    label: "Blob Association",
+    icon: "\u{1F517}",
+    phase: "correlation",
+    desc: "Links license plates to vehicles by maximum bounding-box overlap (IoU). Plate label/conf stored in vehicle's awi_mini_blob. Wheel blobs separated for axle path. Only active when enable_OCR=true.",
+    inputs: ["All blobs (vehicles + plates + wheels)"],
+    outputs: ["Correlated vehicle blobs (with plate inside awi_mini_blob)", "Separate wheel blobs"],
+    config: ["PLATE_VEHICLE_OVERLAP_THRESH", "keep_independent_plate_track"],
+    module: "blob_correlation_module",
+    detail: "Wheels get conf stored, plate mat cloned into vehicle mini_blob",
+    gate: "enable_OCR",
+  },
+  {
+    id: "tracker",
+    label: "ByteTrack Tracker",
+    icon: "\u{1F3AF}",
+    phase: "tracking",
+    desc: "Multi-object tracker using ByteTrack algorithm. Assigns persistent track IDs, maintains history (blob_hist), and produces terminated_tracks when objects leave. Alert frame policy configurable.",
+    inputs: ["Correlated blobs"],
+    outputs: ["Tracked blobs with IDs", "Track history", "Terminated tracks"],
+    config: ["matching_threshold=80", "detection_thr=50", "max_lost=50", "m_tracks_to_live=100", "alert_frame_policy"],
+    module: "tracking_module (bytetrack)",
+    detail: "terminated_tracks trigger downstream VCC logic. Track history capped by clear_tracker.",
+  },
+  {
+    id: "wheel_assoc",
+    label: "Wheel Association",
+    icon: "\u2699\uFE0F",
+    phase: "correlation",
+    desc: "Links wheel detections to vehicles by overlap + vertical-gap proximity. Performs Y-band clustering each frame to group co-axle wheels. Accumulates cluster votes over track lifetime in VehicleAxleTracker.",
+    inputs: ["Tracked vehicle blobs", "Tracked wheel blobs"],
+    outputs: ["Vehicle tracks with crossed_regions (wheel data)", "Per-vehicle axle tracker with cluster votes"],
+    config: ["WHEEL_VEHICLE_OVERLAP_THRESH", "y_threshold = m_frames_to_live \u00d7 10", "MIN_CLUSTER_VOTES=2"],
+    module: "wheel_correlation_module",
+    detail: "Only for bus/truck/mini-bus/mini-truck. Greedy Y-band clustering, vote accumulation, optional debug visualization.",
+    gate: "axle_counting",
+  },
+  {
+    id: "plate_select",
+    label: "Plate Selection",
+    icon: "\u{1F3C5}",
+    phase: "correlation",
+    desc: "Selects the best plate crop from track history based on size and quality heuristics. Ensures downstream OCR gets the clearest plate image.",
+    inputs: ["Track history with plate crops"],
+    outputs: ["Best plate blob per track"],
+    config: ["min_plate_size", "quality_threshold=0.1"],
+    module: "get_best_plate_blob",
+    gate: "enable_OCR",
+  },
+  {
+    id: "secondary_model",
+    label: "Secondary Model",
+    icon: "\u{1F9E0}",
+    phase: "classification",
+    desc: "Vehicle attribute classifier (make, model, color, type). Runs on terminated tracks. Feature vectors stored in blob.feature_map for later aggregation in VCC logic.",
+    inputs: ["Terminated track best blobs"],
+    outputs: ["Feature maps per attribute head (maker, model, color)"],
+    config: ["secondary spec.json", "batch_size", "confidence=0.3"],
+    module: "ModelFactory \u2192 featureextractorclass",
+    detail: "Skipped when axle_counting is enabled. Runs on terminated_tracks policy.",
+    gate: "!axle_counting",
+  },
+  {
+    id: "custom_ocr",
+    label: "Custom OCR (v5)",
+    icon: "\u{1F524}",
+    phase: "ocr",
+    desc: "PaddleOCR v5 model for license plate text recognition. Replaces older v3 pipeline. Processes plate crops and outputs character sequences with per-character confidence.",
+    inputs: ["Best plate crops"],
+    outputs: ["Raw OCR feature vectors in blob.feature_map['ppocr']"],
+    config: ["custom_ocr_spec_path"],
+    module: "custom_ocr_module + ppocr_v5_postprocess",
+    gate: "enable_OCR",
+  },
+  {
+    id: "ocr_post",
+    label: "OCR Postprocess",
+    icon: "\u{1F4DD}",
+    phase: "ocr",
+    desc: "CTC decodes raw OCR outputs \u2192 plate strings. Maintains per-track best/second-best readings keyed by string length. Regex validates Indian plate format. Votes on plate type (Electric/Commercial/HSRP).",
+    inputs: ["Raw OCR vectors", "Track history"],
+    outputs: ["Best OCR label + confidence per track", "Plate type classification"],
+    config: ["Regex: ^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{4}$", "Confidence thresholds (0.15 regex, 0.5 fallback)"],
+    module: "licence_plate_recognition_module_ppocr_postprocess",
+    detail: "Priority: regex-matched \u2192 non-matched \u2192 UNREADABLE. Two-key system tracks top-2 string lengths.",
+    gate: "enable_OCR",
+  },
+  {
+    id: "line_cross",
+    label: "Line Crossing",
+    icon: "\u3030\uFE0F",
+    phase: "tracking",
+    desc: "Detects when tracked objects cross user-defined counting lines (source/sink). Records crossed_lines on each track for directional counting.",
+    inputs: ["Tracked blob trajectories", "Configured counting lines"],
+    outputs: ["Track.crossed_lines with direction"],
+    config: ["Line endpoints", "Source/sink labels"],
+    module: "line_crossing_module",
+  },
+  {
+    id: "clear_track",
+    label: "Track Cleanup",
+    icon: "\u{1F9F9}",
+    phase: "tracking",
+    desc: "Caps track history to TTL (100 frames) to prevent unbounded memory growth. Erases oldest history entries when limit reached.",
+    inputs: ["All active tracks"],
+    outputs: ["Pruned track histories"],
+    config: ["ttl_default=100"],
+    module: "clear_tracker_module",
+    gate: "enable_OCR",
+  },
+  {
+    id: "vcc_logic",
+    label: "VCC Logic",
+    icon: "\u26A1",
+    phase: "logic",
+    desc: "Core business logic on terminated tracks. Label voting, axle classification, attribute aggregation, toll tag assignment, headway computation. Builds final alert events with all metadata.",
+    inputs: ["Terminated tracks", "OCR results", "Axle tracker data", "Attribute features", "Crossed lines"],
+    outputs: ["awi::event with eve_blob[], eve_frame, attrib_list"],
+    config: [
+      "time_sensitivity (min frames)",
+      "space_sensitivity (unreadable toggle)",
+      "recognition_config.confidence",
+    ],
+    module: "vcc_module",
+    detail: "Gates: min track length \u2192 line crossing \u2192 OCR dedup \u2192 unreadable filter \u2192 conf threshold \u2192 axle edge-exit \u2192 wheel presence. Sets Tag Class, Vehicle Class, Axle Count, Axle Configuration, Headway.",
+  },
+  {
+    id: "dedup",
+    label: "Deduplication",
+    icon: "\u{1F501}",
+    phase: "output",
+    desc: "HTTP-based deduplication service. Sends plate images to external service to detect duplicate vehicle alerts across cameras or re-entries. Disabled when fuzzyness=0.",
+    inputs: ["Alert events with plate data"],
+    outputs: ["Deduplicated events"],
+    config: ["dedup_ip (derived from grpc_msvc_uri)", "fuzzyness threshold"],
+    module: "deduplication_module",
+    gate: "fuzzyness > 0",
+  },
+  {
+    id: "send_event",
+    label: "Send Event",
+    icon: "\u{1F4E4}",
+    phase: "output",
+    desc: "Transmits finalized events to Awiros platform backend. Includes vehicle crop, plate crop, wheel crops (axle mode), frame snapshot, and all classification/OCR metadata.",
+    inputs: ["Final events"],
+    outputs: ["HTTP/WebSocket to Awiros backend"],
+    config: ["Event endpoint"],
+    module: "send_event_module",
+  },
+];
+
+const PHASE_META = {
+  ingestion:      { color: "#2dd4bf", bg: "#0d3d38", label: "Ingestion" },
+  detection:      { color: "#f59e0b", bg: "#3d2e08", label: "Detection" },
+  visualization:  { color: "#a78bfa", bg: "#2d2248", label: "Visualization" },
+  correlation:    { color: "#38bdf8", bg: "#0c3049", label: "Correlation" },
+  tracking:       { color: "#fb923c", bg: "#3d2208", label: "Tracking" },
+  classification: { color: "#e879f9", bg: "#3d1248", label: "Classification" },
+  ocr:            { color: "#4ade80", bg: "#0d3d18", label: "OCR" },
+  logic:          { color: "#f43f5e", bg: "#3d0d18", label: "Business Logic" },
+  output:         { color: "#94a3b8", bg: "#1e293b", label: "Output" },
+};
+
+function StageCard({ stage, index, isSelected, onClick, isLast }) {
+  const phase = PHASE_META[stage.phase];
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+      <div
+        onClick={() => onClick(stage.id)}
+        style={{
+          position: "relative",
+          width: 280,
+          background: isSelected ? phase.bg : "#111318",
+          border: `2px solid ${isSelected ? phase.color : "#2a2d35"}`,
+          borderRadius: 12,
+          padding: "16px 18px",
+          cursor: "pointer",
+          transition: "all 0.25s ease",
+          boxShadow: isSelected
+            ? `0 0 24px ${phase.color}30, 0 0 48px ${phase.color}10`
+            : "0 2px 8px #00000040",
+          transform: isSelected ? "scale(1.03)" : "scale(1)",
+        }}
+      >
+        {stage.gate && (
+          <div
+            style={{
+              position: "absolute",
+              top: -10,
+              right: 12,
+              background: "#1c1f26",
+              border: "1px solid #f59e0b60",
+              borderRadius: 6,
+              padding: "1px 8px",
+              fontSize: 10,
+              fontFamily: "'JetBrains Mono', monospace",
+              color: "#f59e0b",
+              letterSpacing: 0.5,
+            }}
+          >
+            {stage.gate}
+          </div>
+        )}
+
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+          <span style={{ fontSize: 20 }}>{stage.icon}</span>
+          <div>
+            <div
+              style={{
+                fontSize: 10,
+                fontFamily: "'JetBrains Mono', monospace",
+                color: phase.color,
+                letterSpacing: 1.5,
+                textTransform: "uppercase",
+                marginBottom: 2,
+              }}
+            >
+              Stage {String(index + 1).padStart(2, "0")} &middot; {phase.label}
+            </div>
+            <div
+              style={{
+                fontSize: 15,
+                fontWeight: 700,
+                color: "#e8eaed",
+                fontFamily: "'Space Grotesk', sans-serif",
+                letterSpacing: -0.3,
+              }}
+            >
+              {stage.label}
+            </div>
+          </div>
+        </div>
+
+        <div
+          style={{
+            fontSize: 12,
+            color: "#8b8f98",
+            lineHeight: 1.5,
+            fontFamily: "'IBM Plex Sans', sans-serif",
+          }}
+        >
+          {stage.desc.slice(0, 120)}{stage.desc.length > 120 ? "\u2026" : ""}
+        </div>
+
+        <div
+          style={{
+            marginTop: 10,
+            fontSize: 10,
+            fontFamily: "'JetBrains Mono', monospace",
+            color: "#565a63",
+            borderTop: "1px solid #2a2d35",
+            paddingTop: 8,
+          }}
+        >
+          {stage.module}
+        </div>
+      </div>
+
+      {!isLast && (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", height: 36 }}>
+          <div
+            style={{
+              width: 2,
+              height: 36,
+              background: `linear-gradient(to bottom, ${phase.color}60, ${PHASE_META[STAGES[index + 1]?.phase]?.color || phase.color}60)`,
+            }}
+          />
+          <div
+            style={{
+              width: 0,
+              height: 0,
+              borderLeft: "6px solid transparent",
+              borderRight: "6px solid transparent",
+              borderTop: `8px solid ${PHASE_META[STAGES[index + 1]?.phase]?.color || phase.color}60`,
+              marginTop: -1,
+            }}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DetailPanel({ stage }) {
+  const phase = PHASE_META[stage.phase];
+  const Section = ({ title, items, mono }) => (
+    <div style={{ marginBottom: 16 }}>
+      <div
+        style={{
+          fontSize: 10,
+          fontFamily: "'JetBrains Mono', monospace",
+          color: phase.color,
+          letterSpacing: 1.5,
+          textTransform: "uppercase",
+          marginBottom: 8,
+        }}
+      >
+        {title}
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        {items.map((item, i) => (
+          <div
+            key={i}
+            style={{
+              fontSize: 12,
+              color: "#c8cbd2",
+              fontFamily: mono ? "'JetBrains Mono', monospace" : "'IBM Plex Sans', sans-serif",
+              background: "#0a0c10",
+              borderRadius: 6,
+              padding: "6px 10px",
+              borderLeft: `2px solid ${phase.color}40`,
+            }}
+          >
+            {item}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
+  return (
+    <div
+      style={{
+        background: "#111318",
+        border: `1px solid ${phase.color}40`,
+        borderRadius: 14,
+        padding: 24,
+        width: 380,
+        maxHeight: "85vh",
+        overflowY: "auto",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+        <span style={{ fontSize: 28 }}>{stage.icon}</span>
+        <div>
+          <div
+            style={{
+              fontSize: 10,
+              fontFamily: "'JetBrains Mono', monospace",
+              color: phase.color,
+              letterSpacing: 1.5,
+              textTransform: "uppercase",
+            }}
+          >
+            {phase.label}
+          </div>
+          <div
+            style={{
+              fontSize: 20,
+              fontWeight: 700,
+              color: "#e8eaed",
+              fontFamily: "'Space Grotesk', sans-serif",
+            }}
+          >
+            {stage.label}
+          </div>
+        </div>
+      </div>
+
+      <div
+        style={{
+          fontSize: 13,
+          color: "#9ca0a8",
+          lineHeight: 1.7,
+          marginBottom: 20,
+          fontFamily: "'IBM Plex Sans', sans-serif",
+        }}
+      >
+        {stage.desc}
+      </div>
+
+      {stage.detail && (
+        <div
+          style={{
+            fontSize: 12,
+            color: "#f59e0b",
+            background: "#f59e0b10",
+            border: "1px solid #f59e0b30",
+            borderRadius: 8,
+            padding: "10px 12px",
+            marginBottom: 16,
+            fontFamily: "'IBM Plex Sans', sans-serif",
+            lineHeight: 1.6,
+          }}
+        >
+          &#9888; {stage.detail}
+        </div>
+      )}
+
+      <Section title="Inputs" items={stage.inputs} />
+      <Section title="Outputs" items={stage.outputs} />
+      <Section title="Configuration" items={stage.config} mono />
+
+      <div
+        style={{
+          marginTop: 16,
+          padding: "10px 12px",
+          background: "#0a0c10",
+          borderRadius: 8,
+          border: "1px solid #2a2d35",
+        }}
+      >
+        <div
+          style={{
+            fontSize: 10,
+            fontFamily: "'JetBrains Mono', monospace",
+            color: "#565a63",
+            marginBottom: 4,
+          }}
+        >
+          C++ MODULE
+        </div>
+        <div
+          style={{
+            fontSize: 13,
+            fontFamily: "'JetBrains Mono', monospace",
+            color: phase.color,
+          }}
+        >
+          {stage.module}
+        </div>
+      </div>
+
+      {stage.gate && (
+        <div
+          style={{
+            marginTop: 12,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "8px 12px",
+            background: "#f59e0b10",
+            borderRadius: 8,
+            border: "1px solid #f59e0b30",
+          }}
+        >
+          <span style={{ fontSize: 14 }}>{"\u{1F512}"}</span>
+          <div>
+            <div style={{ fontSize: 10, color: "#f59e0b", fontFamily: "'JetBrains Mono', monospace" }}>
+              CONDITIONAL GATE
+            </div>
+            <div style={{ fontSize: 12, color: "#fbbf24", fontFamily: "'JetBrains Mono', monospace" }}>
+              {stage.gate}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Legend() {
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexWrap: "wrap",
+        gap: 12,
+        padding: "12px 16px",
+        background: "#0a0c10",
+        borderRadius: 10,
+        border: "1px solid #1e2028",
+        marginBottom: 24,
+      }}
+    >
+      {Object.entries(PHASE_META).map(([key, val]) => (
+        <div key={key} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <div
+            style={{
+              width: 10,
+              height: 10,
+              borderRadius: 3,
+              background: val.color,
+              boxShadow: `0 0 6px ${val.color}60`,
+            }}
+          />
+          <span
+            style={{
+              fontSize: 11,
+              color: "#8b8f98",
+              fontFamily: "'JetBrains Mono', monospace",
+              letterSpacing: 0.5,
+            }}
+          >
+            {val.label}
+          </span>
+        </div>
+      ))}
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 8 }}>
+        <div
+          style={{
+            padding: "1px 6px",
+            fontSize: 9,
+            fontFamily: "'JetBrains Mono', monospace",
+            color: "#f59e0b",
+            border: "1px solid #f59e0b60",
+            borderRadius: 4,
+          }}
+        >
+          gate
+        </div>
+        <span style={{ fontSize: 11, color: "#8b8f98", fontFamily: "'JetBrains Mono', monospace" }}>
+          = Conditional module
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function VCCPipelineFlowchart() {
+  const [selected, setSelected] = useState("camera");
+  const selectedStage = STAGES.find((s) => s.id === selected);
+  const scrollRef = useRef(null);
+
+  useEffect(() => {
+    const el = document.getElementById(`stage-${selected}`);
+    if (el && scrollRef.current) {
+      const container = scrollRef.current;
+      const elTop = el.offsetTop;
+      const containerHeight = container.clientHeight;
+      const elHeight = el.offsetHeight;
+      container.scrollTo({
+        top: elTop - containerHeight / 2 + elHeight / 2,
+        behavior: "smooth",
+      });
+    }
+  }, [selected]);
+
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        background: "#08090c",
+        color: "#e8eaed",
+        fontFamily: "'IBM Plex Sans', sans-serif",
+        padding: "32px 24px",
+      }}
+    >
+      <div style={{ maxWidth: 760, margin: "0 auto", marginBottom: 28 }}>
+        <div
+          style={{
+            fontSize: 11,
+            fontFamily: "'JetBrains Mono', monospace",
+            color: "#f43f5e",
+            letterSpacing: 2,
+            textTransform: "uppercase",
+            marginBottom: 8,
+          }}
+        >
+          System Architecture
+        </div>
+        <h1
+          style={{
+            fontSize: 28,
+            fontWeight: 700,
+            fontFamily: "'Space Grotesk', sans-serif",
+            margin: 0,
+            marginBottom: 6,
+            letterSpacing: -0.5,
+          }}
+        >
+          VCC Pipeline Flowchart
+        </h1>
+        <p
+          style={{
+            fontSize: 14,
+            color: "#6b7080",
+            margin: 0,
+            marginBottom: 20,
+            lineHeight: 1.6,
+          }}
+        >
+          Vehicle Count &amp; Classification &middot; {STAGES.length} processing stages &middot; Click any stage for full details
+        </p>
+        <Legend />
+      </div>
+
+      <div
+        style={{
+          display: "flex",
+          gap: 32,
+          maxWidth: 760,
+          margin: "0 auto",
+          alignItems: "flex-start",
+        }}
+      >
+        <div
+          ref={scrollRef}
+          style={{
+            flex: "0 0 auto",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            maxHeight: "82vh",
+            overflowY: "auto",
+            paddingRight: 8,
+            paddingBottom: 24,
+            scrollbarWidth: "thin",
+            scrollbarColor: "#2a2d35 transparent",
+          }}
+        >
+          {STAGES.map((stage, i) => (
+            <div key={stage.id} id={`stage-${stage.id}`}>
+              <StageCard
+                stage={stage}
+                index={i}
+                isSelected={selected === stage.id}
+                onClick={setSelected}
+                isLast={i === STAGES.length - 1}
+              />
+            </div>
+          ))}
+        </div>
+
+        <div style={{ flex: 1, position: "sticky", top: 32 }}>
+          {selectedStage && <DetailPanel stage={selectedStage} />}
+        </div>
+      </div>
+
+      <div
+        style={{
+          maxWidth: 760,
+          margin: "32px auto 0",
+          padding: 20,
+          background: "#0d0f14",
+          borderRadius: 12,
+          border: "1px solid #1e2028",
+        }}
+      >
+        <div
+          style={{
+            fontSize: 10,
+            fontFamily: "'JetBrains Mono', monospace",
+            color: "#f43f5e",
+            letterSpacing: 1.5,
+            textTransform: "uppercase",
+            marginBottom: 12,
+          }}
+        >
+          Infinite Loop Execution
+        </div>
+        <div style={{ fontSize: 13, color: "#6b7080", lineHeight: 1.7, fontFamily: "'IBM Plex Sans', sans-serif" }}>
+          All modules are registered as <code style={{ color: "#38bdf8", background: "#38bdf810", padding: "2px 5px", borderRadius: 3, fontSize: 12 }}>static</code> instances
+          into <code style={{ color: "#38bdf8", background: "#38bdf810", padding: "2px 5px", borderRadius: 3, fontSize: 12 }}>common_modules</code> vector.{" "}
+          <code style={{ color: "#38bdf8", background: "#38bdf810", padding: "2px 5px", borderRadius: 3, fontSize: 12 }}>play_pipeline()</code> runs{" "}
+          <code style={{ color: "#f43f5e", background: "#f43f5e10", padding: "2px 5px", borderRadius: 3, fontSize: 12 }}>while(1)</code>{" "}
+          calling each module's <code style={{ color: "#38bdf8", background: "#38bdf810", padding: "2px 5px", borderRadius: 3, fontSize: 12 }}>run(meta)</code> in registration order.
+          Shared state flows through <code style={{ color: "#4ade80", background: "#4ade8010", padding: "2px 5px", borderRadius: 3, fontSize: 12 }}>awi::meta</code> — streams, blobs, tracks, events.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<VCCPipelineFlowchart />);
+</script>
+</body>
+</html>
